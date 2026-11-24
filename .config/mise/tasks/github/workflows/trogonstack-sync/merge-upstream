@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#MISE description="Merge upstream main, committing any conflicts so they can be published as a pull request"
+set -euo pipefail
+git config user.name 'github-actions[bot]'
+git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+if git merge --no-ff --no-edit -m "chore(sync): merge upstream main $UPSTREAM_SHORT" "$UPSTREAM_SHA"; then
+  conflict=false
+else
+  # Commit the conflict markers instead of aborting, so the merge can be
+  # finished on the pull request branch rather than redone by hand.
+  git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+  git add -A
+  git commit --no-edit -m "chore(sync): merge upstream $UPSTREAM_SHORT with conflicts"
+  conflict=true
+fi
+# The publish job pushes exactly this commit, so it is bundled here, before
+# the build and tests run any upstream code.
+git bundle create "$RUNNER_TEMP/sync.bundle" HEAD ^origin/main
+{
+  echo "conflict=$conflict"
+  echo "sha=$(git rev-parse HEAD)"
+} >> "$GITHUB_OUTPUT"
