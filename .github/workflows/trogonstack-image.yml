@@ -2,18 +2,27 @@ name: trogonstack-image
 
 # main = upstream main + our patch commits. Builds the proxy image so fixes run
 # before upstream ships them. Each platform builds on a native runner, then the
-# digests are joined into one image index.
+# digests are joined into one image index. The cluster runs amd64; arm64 is
+# kept in case that changes, and costs no emulation.
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Tag the built image with the next CalVer version (main only)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/trogonstack/images/agentgateway/agentgateway
+  # A pull request pushes only when it comes from this repository, so fork PRs
+  # build without a registry write.
+  PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
   build:
@@ -32,31 +41,50 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-mise
+      - id: image
+        run: mise run github:workflows:trogonstack-image:image-name
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: env.PUSH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        env:
+          # Annotations land on each platform manifest. The index gets its own
+          # in the merge job.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest
+          # Label the pull request head commit, not the merge commit.
+          DOCKER_METADATA_PR_HEAD_SHA: 'true'
+        with:
+          images: ${{ steps.image.outputs.name }}
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
           provenance: mode=min
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
-            VERSION=trogonstack-${{ github.sha }}
-            GIT_REVISION=${{ github.sha }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+            VERSION=trogonstack-${{ github.event.pull_request.head.sha || github.sha }}
+            GIT_REVISION=${{ github.event.pull_request.head.sha || github.sha }}
+          # Pushed by digest: the tags are put on the joined index below.
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=${{ env.PUSH == 'true' }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
       - name: Export digest
+        if: env.PUSH == 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p "${RUNNER_TEMP}/digests"
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.PUSH == 'true'
         with:
           name: digest-${{ strategy.job-index }}
           path: ${{ runner.temp }}/digests/*
@@ -64,11 +92,19 @@ jobs:
 
   merge:
     needs: build
+    # The job-level if cannot read env, so the PUSH condition is repeated.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-mise
+      - id: image
+        run: mise run github:workflows:trogonstack-image:image-name
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: digest-*
@@ -80,9 +116,43 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        env:
+          # Annotations land on the image index.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+          # Label the pull request head commit, not the merge commit.
+          DOCKER_METADATA_PR_HEAD_SHA: 'true'
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=sha,format=long,prefix=,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=pr-${{ github.event.pull_request.head.sha }},enable=${{ github.event_name == 'pull_request' }}
       - name: Create image index
+        id: index
         working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
         run: |
-          docker buildx imagetools create -t "${IMAGE}:${GITHUB_SHA}" \
-            $(printf "${IMAGE}@sha256:%s " *)
-          docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}"
+          mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          mapfile -t annotations < <(jq -r '.annotations[] | "--annotation", .' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${tags[@]}" "${annotations[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${tags[1]}"
+          echo "digest=$(docker buildx imagetools inspect "${tags[1]}" --format '{{json .Manifest}}' | jq -r .digest)" >> "$GITHUB_OUTPUT"
+      - env:
+          REF: ${{ steps.image.outputs.name }}@${{ steps.index.outputs.digest }}
+        run: mise run github:workflows:trogonstack-image:summary
+
+  release:
+    needs: merge
+    if: github.event_name == 'workflow_dispatch' && inputs.release && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/trogonstack-release.yml
+    with:
+      commit: ${{ github.sha }}

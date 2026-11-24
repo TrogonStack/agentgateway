@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#MISE description="Build and test the merged tree"
+set -euo pipefail
+# The runner's rustup has no toolchain pinned by the merged tree, so install
+# the channel rust-toolchain.toml names. Exporting it keeps cargo from
+# resolving the file again and pulling its clippy and rustfmt components.
+channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+if [ -z "$channel" ]; then
+  echo "No channel in rust-toolchain.toml" >&2
+  exit 1
+fi
+rustup toolchain install "$channel" --profile minimal
+export RUSTUP_TOOLCHAIN="$channel"
+
+# Upstream's proxy-test job runs `make test` (every test, bench and example)
+# on a cached 4 vCPU runner with Keycloak and Postgres. A cold build of all of
+# that does not fit this job's budget, and the service-backed tests are skipped
+# here anyway. These two cover the code our patch commits touch and the code
+# they run in: the LLM translation crate and the proxy crate's unit tests. If
+# upstream main later breaks something outside them, widen this list.
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_TEST_DEBUG=0
+cargo test -p agent-llm
+cargo test -p agentgateway --lib

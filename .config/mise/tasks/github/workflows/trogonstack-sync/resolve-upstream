@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#MISE description="Resolve upstream main and report whether main contains it"
+set -euo pipefail
+# Upstream main is merged, not its release tags: our fixes are unreleased, and
+# main must never fall behind it. Only the commit is fetched, never a tag.
+git fetch --no-tags "$UPSTREAM" main
+sha="$(git rev-parse FETCH_HEAD)"
+echo "sha=$sha" >> "$GITHUB_OUTPUT"
+echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+if git merge-base --is-ancestor "$sha" HEAD; then
+  echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+  echo "main already contains upstream main $sha" >> "$GITHUB_STEP_SUMMARY"
+else
+  echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+fi
