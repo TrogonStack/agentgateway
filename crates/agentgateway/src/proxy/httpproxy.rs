@@ -826,7 +826,13 @@ impl HTTPProxy {
 				.await
 				.unwrap_or_else(|e| e.into_response_with_grpc(is_grpc_request))
 		} else {
-			resp.map(move |body| body.with_observer(log))
+			resp.map(move |body| {
+				// Hyper drops a body that is already at its end without polling it.
+				if !http_body::Body::is_end_stream(&body) {
+					log.with(|l| l.response_body_unfinished = true);
+				}
+				body.with_observer(log)
+			})
 		}
 	}
 

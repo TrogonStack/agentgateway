@@ -937,10 +937,8 @@ impl DropOnLog {
 			.gen_ai_request_duration
 			.get_or_create(&GenAIRequestDurationLabels {
 				common: gen_ai_labels.clone().into(),
-				error: gen_ai_operation_failed(log)
-					.then_some(ErrorTypeLabel {
-						error_type: GenAIErrorType::Other,
-					})
+				error: gen_ai_error_type(log)
+					.map(|error_type| ErrorTypeLabel { error_type })
 					.into(),
 			})
 			.observe(duration.as_secs_f64());
@@ -1189,6 +1187,7 @@ impl RequestLog {
 			response_snapshot: None,
 			source_context: None,
 			response_bytes: 0,
+			response_body_unfinished: false,
 		}
 	}
 
@@ -1446,10 +1445,36 @@ pub struct RequestLog {
 	pub source_context: Option<cel::SourceContext>,
 
 	pub response_bytes: u64,
+	/// Set while a response body is handed to the client and has not reached its end.
+	/// A log dropped in that state means the client went away mid-response.
+	pub response_body_unfinished: bool,
 }
 
-fn request_log_level(error: Option<&str>) -> &'static str {
-	if error.is_some() { "error" } else { "info" }
+impl RequestLog {
+	/// A response body that never reached its end means the client hung up. Unlike a body
+	/// that failed upstream, that is not an error, so it is recorded as the response's reason.
+	pub fn note_unfinished_response_body(&mut self) {
+		if self.response_body_unfinished && self.error.is_none() {
+			self.reason = Some(ProxyResponseReason::ClientDisconnected);
+		}
+	}
+}
+
+fn request_log_level(error: Option<&str>, reason: Option<ProxyResponseReason>) -> &'static str {
+	if error.is_some() {
+		"error"
+	} else if reason == Some(ProxyResponseReason::ClientDisconnected) {
+		"warn"
+	} else {
+		"info"
+	}
+}
+
+fn gen_ai_error_type(request: &RequestLog) -> Option<GenAIErrorType> {
+	if request.reason == Some(ProxyResponseReason::ClientDisconnected) {
+		return Some(GenAIErrorType::ClientDisconnected);
+	}
+	gen_ai_operation_failed(request).then_some(GenAIErrorType::Other)
 }
 
 fn gen_ai_operation_failed(request: &RequestLog) -> bool {
@@ -1539,6 +1564,7 @@ impl Drop for DropOnLog {
 			let Some(mut log) = self.log.take() else {
 				return;
 			};
+			log.note_unfinished_response_body();
 
 			let route_identifier = RouteIdentifier {
 				bind: (&log.bind_name).into(),
@@ -1737,11 +1763,11 @@ impl Drop for DropOnLog {
 					.inc();
 			}
 
-			let level = request_log_level(log.error.as_deref());
-			let level_filter = if level == "error" {
-				Level::ERROR
-			} else {
-				Level::INFO
+			let level = request_log_level(log.error.as_deref(), log.reason);
+			let level_filter = match level {
+				"error" => Level::ERROR,
+				"warn" => Level::WARN,
+				_ => Level::INFO,
 			};
 			let maybe_enable_log = agent_core::telemetry::enabled("request", &level_filter);
 			let otlp_log_enabled = log.otel_logger.is_some();
@@ -2458,6 +2484,11 @@ impl agent_http::BodyObserver for DropOnLog {
 			log.error = Some(format!("response body failed: {error}"));
 		}
 	}
+	fn on_end_stream(&mut self) {
+		if let Some(log) = self.as_mut() {
+			log.response_body_unfinished = false;
+		}
+	}
 	fn on_frame(&mut self, frame: &Frame<Bytes>) {
 		if let Some(trailer) = frame.trailers_ref()
 			&& let Some(grpc) = self.as_mut().map(|log| log.grpc_status.clone())
@@ -3018,6 +3049,8 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 	use std::time::Instant;
 
+	use http_body::Body as _;
+	use http_body_util::BodyExt as _;
 	use opentelemetry::InstrumentationScope;
 	use opentelemetry::trace::SpanKind;
 	use opentelemetry_sdk::error::OTelSdkResult;
@@ -3414,6 +3447,170 @@ mod tests {
 				),
 			}
 		}
+	}
+
+	fn label_value(line: &str, label: &str) -> Option<String> {
+		line
+			.split(&format!("{label}=\""))
+			.nth(1)
+			.map(|rest| rest.split('"').next().unwrap().to_string())
+	}
+
+	/// Sends an LLM response through a body observed by the access log and lets
+	/// `deliver` play the client's part. Returns the `error.type` label of the
+	/// request's GenAI duration metric and the `reason` label of its request counter.
+	async fn metric_labels_after_delivery<F, Fut>(
+		body: agent_http::Body,
+		deliver: F,
+	) -> (Option<String>, Option<String>)
+	where
+		F: FnOnce(agent_http::Body) -> Fut,
+		Fut: std::future::Future<Output = ()>,
+	{
+		let (mut log, registry) = test_request_log_with_registry();
+		log.status = Some(http::StatusCode::OK);
+		log.reason = Some(ProxyResponseReason::Upstream);
+		log.llm_request = Some(metric_test_llm_request());
+		let mut log: DropOnLog = log.into();
+		if !body.is_end_stream() {
+			log.with(|l| l.response_body_unfinished = true);
+		}
+		deliver(body.with_observer(log)).await;
+		let encoded = encoded_metrics(&registry);
+		let line = |prefix: &str| {
+			encoded
+				.lines()
+				.find(|line| line.starts_with(prefix))
+				.unwrap_or_else(|| panic!("no {prefix} in:\n{encoded}"))
+		};
+		(
+			label_value(line("gen_ai_server_request_duration_count"), "error_type"),
+			label_value(line("requests_total"), "reason"),
+		)
+	}
+
+	fn two_chunks() -> agent_http::Body {
+		agent_http::Body::from_stream(futures_util::stream::iter([
+			Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: one\n\n")),
+			Ok(bytes::Bytes::from_static(b"data: two\n\n")),
+		]))
+	}
+
+	fn disconnected() -> (Option<String>, Option<String>) {
+		(
+			Some("client_disconnected".to_string()),
+			Some("ClientDisconnected".to_string()),
+		)
+	}
+
+	fn delivered() -> (Option<String>, Option<String>) {
+		(None, Some("Upstream".to_string()))
+	}
+
+	#[tokio::test]
+	async fn client_dropping_the_response_body_early_is_a_disconnect_not_an_error() {
+		let labels = metric_labels_after_delivery(two_chunks(), |mut body| async move {
+			assert!(body.frame().await.unwrap().is_ok());
+			drop(body);
+		})
+		.await;
+		assert_eq!(labels, disconnected());
+	}
+
+	#[tokio::test]
+	async fn client_dropping_the_response_body_unpolled_is_a_disconnect() {
+		let labels = metric_labels_after_delivery(two_chunks(), |body| async move {
+			drop(body);
+		})
+		.await;
+		assert_eq!(labels, disconnected());
+	}
+
+	#[tokio::test]
+	async fn response_body_read_to_the_end_is_not_a_disconnect() {
+		let labels = metric_labels_after_delivery(two_chunks(), |mut body| async move {
+			while body.frame().await.is_some() {}
+		})
+		.await;
+		assert_eq!(labels, delivered());
+
+		// A sized body can be dropped after its last frame without polling None.
+		let labels = metric_labels_after_delivery(
+			agent_http::Body::from("data: one\n\n"),
+			|mut body| async move {
+				assert!(body.frame().await.unwrap().is_ok());
+			},
+		)
+		.await;
+		assert_eq!(labels, delivered());
+	}
+
+	#[tokio::test]
+	async fn empty_response_body_dropped_unpolled_is_not_a_disconnect() {
+		let labels = metric_labels_after_delivery(agent_http::Body::empty(), |body| async move {
+			drop(body);
+		})
+		.await;
+		assert_eq!(labels, delivered());
+	}
+
+	#[tokio::test]
+	async fn upstream_failing_mid_response_is_still_an_error() {
+		let labels = metric_labels_after_delivery(
+			agent_http::Body::from_stream(futures_util::stream::iter([Err::<bytes::Bytes, _>(
+				std::io::Error::other("upstream failed"),
+			)])),
+			|mut body| async move {
+				assert!(body.frame().await.unwrap().is_err());
+			},
+		)
+		.await;
+		assert_eq!(
+			labels,
+			(Some("_OTHER".to_string()), Some("Upstream".to_string()))
+		);
+	}
+
+	#[test]
+	fn client_disconnects_log_as_warnings_and_failures_as_errors() {
+		let disconnect = Some(ProxyResponseReason::ClientDisconnected);
+		assert_eq!(request_log_level(None, None), "info");
+		assert_eq!(request_log_level(None, disconnect), "warn");
+		assert_eq!(request_log_level(Some("boom"), disconnect), "error");
+		assert_eq!(request_log_level(Some("boom"), None), "error");
+	}
+
+	#[test]
+	fn unfinished_response_body_is_recorded_as_a_client_disconnect() {
+		let mut log = test_request_log();
+		log.response_body_unfinished = true;
+		log.note_unfinished_response_body();
+		assert_eq!(log.reason, Some(ProxyResponseReason::ClientDisconnected));
+		assert_eq!(log.error, None);
+	}
+
+	#[test]
+	fn failed_response_body_keeps_its_own_error() {
+		let mut log: DropOnLog = test_request_log().into();
+		log.with(|l| l.response_body_unfinished = true);
+		agent_http::BodyObserver::on_error(&mut log, &agent_http::Error::new("upstream failed"));
+		log.with(|l| l.note_unfinished_response_body());
+		let log = log.as_ref().unwrap();
+		assert_eq!(
+			log.error.as_deref(),
+			Some("response body failed: upstream failed")
+		);
+		assert_eq!(log.reason, None);
+	}
+
+	#[test]
+	fn completed_response_body_records_no_error() {
+		let mut log: DropOnLog = test_request_log().into();
+		log.with(|l| l.response_body_unfinished = true);
+		agent_http::BodyObserver::on_end_stream(&mut log);
+		log.with(|l| l.note_unfinished_response_body());
+		let log = log.as_ref().unwrap();
+		assert_eq!((&log.error, log.reason), (&None, None));
 	}
 
 	#[test]

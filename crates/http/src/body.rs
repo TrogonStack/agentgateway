@@ -22,6 +22,9 @@ mod tests;
 pub trait BodyObserver: Send + 'static {
 	fn on_frame(&mut self, _frame: &Frame<Bytes>) {}
 	fn on_error(&mut self, _error: &axum_core::Error) {}
+	/// The body was delivered in full. It never fires for a body that errored or was
+	/// dropped first, and may fire more than once.
+	fn on_end_stream(&mut self) {}
 }
 
 #[derive(Default)]
@@ -101,6 +104,11 @@ impl BodyObserver for ReplayObservers {
 	fn on_frame(&mut self, frame: &Frame<Bytes>) {
 		for observer in &mut self.0.lock().0 {
 			observer.on_frame(frame);
+		}
+	}
+	fn on_end_stream(&mut self) {
+		for observer in &mut self.0.lock().0 {
+			observer.on_end_stream();
 		}
 	}
 }
@@ -697,6 +705,17 @@ impl http_body::Body for Body {
 			if let Some(Ok(frame)) = frame {
 				for observer in &mut this.observers.0 {
 					observer.on_frame(frame);
+				}
+			}
+			// Consumers may stop after the last frame without polling None.
+			let ended = match frame {
+				None => true,
+				Some(Ok(frame)) => frame.trailers_ref().is_some() || this.representation.is_end_stream(),
+				Some(Err(_)) => false,
+			};
+			if ended {
+				for observer in &mut this.observers.0 {
+					observer.on_end_stream();
 				}
 			}
 			if let Some(recorded) = &this.recorded {

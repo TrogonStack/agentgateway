@@ -141,6 +141,9 @@ pub struct ErrorTypeLabel {
 #[derive(Clone, Hash, Debug, PartialEq, Eq)]
 pub enum GenAIErrorType {
 	Other,
+	/// The client went away before the response finished. This is not a failure of
+	/// the gateway or the provider, so alerts can exclude it.
+	ClientDisconnected,
 }
 
 impl prometheus_client::encoding::EncodeLabelValue for GenAIErrorType {
@@ -150,6 +153,7 @@ impl prometheus_client::encoding::EncodeLabelValue for GenAIErrorType {
 	) -> Result<(), std::fmt::Error> {
 		match self {
 			Self::Other => "_OTHER".encode(encoder),
+			Self::ClientDisconnected => "client_disconnected".encode(encoder),
 		}
 	}
 }
@@ -439,7 +443,7 @@ impl Metrics {
 		let gen_ai_request_duration = histogram_family(histogram_mode, &REQUEST_DURATION_BUCKET);
 		registry.register(
 			"gen_ai_server_request_duration",
-			"Duration of a generative AI request in seconds; failed operations have error_type=\"_OTHER\" and successful operations omit the label",
+			"Duration of a generative AI request in seconds; failed operations have error_type=\"_OTHER\", operations the client abandoned mid-response have error_type=\"client_disconnected\", and successful operations omit the label",
 			gen_ai_request_duration.clone(),
 		);
 
