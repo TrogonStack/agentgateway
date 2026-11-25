@@ -826,7 +826,16 @@ impl HTTPProxy {
 				.await
 				.unwrap_or_else(|e| e.into_response_with_grpc(is_grpc_request))
 		} else {
-			resp.map(move |body| body.with_observer(log))
+			let status = resp.status();
+			resp.map(move |body| {
+				let body_at_end = http_body::Body::is_end_stream(&body);
+				log.with(|l| {
+					if hyper_polls_response_body(l.method.as_ref(), status, body_at_end) {
+						l.response_body_unfinished = true;
+					}
+				});
+				body.with_observer(log)
+			})
 		}
 	}
 
@@ -3980,6 +3989,21 @@ fn is_stale_assignment(res: &Result<Response, SnapshottedProxyError>) -> bool {
 	}
 }
 
+/// Hyper drops a response body without polling it when the body is already at its end, the
+/// request is HEAD, or the status forbids a payload (1xx, 204, 304). Only a body hyper will poll
+/// can be left unfinished by a client disconnect.
+fn hyper_polls_response_body(
+	method: Option<&::http::Method>,
+	status: StatusCode,
+	body_at_end: bool,
+) -> bool {
+	!body_at_end
+		&& method != Some(&::http::Method::HEAD)
+		&& !status.is_informational()
+		&& status != StatusCode::NO_CONTENT
+		&& status != StatusCode::NOT_MODIFIED
+}
+
 #[cfg(test)]
 mod tests {
 	use std::collections::{HashMap, HashSet};
@@ -3995,6 +4019,32 @@ mod tests {
 		evaluate_dynamic_backend_target, hop_by_hop_headers, resolved_workload_target_hostname,
 		select_service_target_port, spiffe_backend_alpns,
 	};
+
+	#[test]
+	fn hyper_polls_response_body_only_for_payload_carrying_responses() {
+		use super::hyper_polls_response_body;
+		use ::http::{Method, StatusCode};
+		let get = Some(&Method::GET);
+		assert!(hyper_polls_response_body(get, StatusCode::OK, false));
+		assert!(hyper_polls_response_body(None, StatusCode::OK, false));
+		assert!(!hyper_polls_response_body(get, StatusCode::OK, true));
+		assert!(!hyper_polls_response_body(
+			Some(&Method::HEAD),
+			StatusCode::OK,
+			false
+		));
+		assert!(!hyper_polls_response_body(
+			get,
+			StatusCode::NO_CONTENT,
+			false
+		));
+		assert!(!hyper_polls_response_body(
+			get,
+			StatusCode::NOT_MODIFIED,
+			false
+		));
+		assert!(!hyper_polls_response_body(get, StatusCode::CONTINUE, false));
+	}
 
 	#[test]
 	fn dynamic_backend_target_expression_rejects_unix_socket() {

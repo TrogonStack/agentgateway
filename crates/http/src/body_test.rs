@@ -143,6 +143,53 @@ async fn observers_receive_stream_errors_and_idle_timeouts() {
 }
 
 #[tokio::test]
+async fn observers_learn_when_the_body_reached_its_end() {
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	struct Observer(Arc<AtomicUsize>);
+	impl crate::BodyObserver for Observer {
+		fn on_end_stream(&mut self) {
+			self.0.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+	let streamed = || {
+		Body::from_stream(futures_util::stream::iter([
+			Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+			Ok(Bytes::from_static(b"def")),
+		]))
+	};
+
+	// Polled until the stream returns None.
+	let ended = Arc::new(AtomicUsize::new(0));
+	let mut body = streamed().with_observer(Observer(ended.clone()));
+	while body.frame().await.is_some() {}
+	assert_eq!(ended.load(Ordering::Relaxed), 1);
+
+	// Hyper stops after the last frame of a sized body without polling None.
+	let ended = Arc::new(AtomicUsize::new(0));
+	let mut body = Body::from("abc").with_observer(Observer(ended.clone()));
+	assert!(body.frame().await.unwrap().is_ok());
+	assert!(body.is_end_stream());
+	assert_eq!(ended.load(Ordering::Relaxed), 1);
+
+	// Dropped before the end, as when the client disconnects.
+	let ended = Arc::new(AtomicUsize::new(0));
+	let mut body = streamed().with_observer(Observer(ended.clone()));
+	assert!(body.frame().await.unwrap().is_ok());
+	drop(body);
+	assert_eq!(ended.load(Ordering::Relaxed), 0);
+
+	// A failed stream did not reach its end.
+	let ended = Arc::new(AtomicUsize::new(0));
+	let mut body = Body::from_stream(futures_util::stream::iter([Err::<Bytes, _>(
+		std::io::Error::other("upstream failed"),
+	)]))
+	.with_observer(Observer(ended.clone()));
+	assert!(body.frame().await.unwrap().is_err());
+	assert_eq!(ended.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn empty_replacement_completes_existing_recording_without_polling() {
 	for replacement in [
 		crate::BodyContent::Buffered(Bytes::new()),
