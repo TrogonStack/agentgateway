@@ -153,8 +153,13 @@ pub enum ProxyResponseReason {
 	MCP,
 	/// The upstream request failed
 	UpstreamFailure,
+<<<<<<< HEAD
 	/// The client closed the connection before the response was fully sent
 	ClientDisconnected,
+=======
+	/// The client disconnected before a response was produced
+	DownstreamDisconnect,
+>>>>>>> 134cbf02e02742cce08ad52cdd221fef579186b8
 }
 
 impl Display for ProxyResponseReason {

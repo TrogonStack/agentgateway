@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use agent_core::strng;
 use itertools::Itertools;
-use openapiv3::OpenAPI;
 use rmcp::RoleClient;
 use rmcp::model::{ClientJsonRpcMessage, InitializeRequestParams, RequestId};
 use rmcp::service::RunningService;
@@ -2644,7 +2643,8 @@ fn skills_result(method: &str) -> serde_json::Value {
 			"frontmatter": {"name": name, "description": "A skill.", "license": "MIT"},
 			"resources": [
 				{"uri": format!("skill://{name}/SKILL.md"), "digest": "sha256:d248", "size": 149},
-				{"uri": format!("skill://{name}/references/checklist.md"), "digest": "sha256:dbab", "size": 65}
+				{"uri": format!("skill://{name}/references/checklist.md"), "digest": "sha256:dbab", "size": 65},
+				{"uri": format!("skill://{name}/references/private.md"), "digest": "sha256:91c0", "size": 12}
 			],
 			"_meta": {"example.com/owner": "team-a"}
 		})
@@ -2673,7 +2673,41 @@ fn skills_result(method: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn modern_skills_methods_single_target_authorization() {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use crate::test_helpers::extmcpmock::{closure_mock, pass_request, pass_response};
+
 	let mock = mock_modern_streamable_http_server().await;
+	let directory_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let directory_responses = Arc::new(AtomicUsize::new(0));
+	let guardrails = closure_mock(
+		{
+			let requests = directory_requests.clone();
+			move |req| {
+				requests.lock().unwrap().push(req.mcp_request.clone());
+				pass_request()
+			}
+		},
+		{
+			let responses = directory_responses.clone();
+			move |_| {
+				responses.fetch_add(1, Ordering::Relaxed);
+				pass_response()
+			}
+		},
+	)
+	.spawn()
+	.await;
+	let directory_guardrails = guardrails_test_support::policy_with(
+		guardrails.address,
+		crate::mcp::guardrails::FailureMode::FailClosed,
+		[(
+			"resources/directory/read".to_string(),
+			crate::mcp::guardrails::Phase::Full,
+		)]
+		.into(),
+		Default::default(),
+	);
 	let deny_secret = McpAuthorization::new(RuleSet::new(PolicySet::new(
 		vec![],
 		vec![Arc::new(
@@ -2688,7 +2722,10 @@ async fn modern_skills_methods_single_target_authorization() {
 		&mock,
 		true,
 		false,
-		vec![BackendTrafficPolicy::McpAuthorization(deny_secret)],
+		vec![
+			BackendTrafficPolicy::McpAuthorization(deny_secret),
+			directory_guardrails,
+		],
 	)
 	.await;
 	let client = reqwest::Client::new();
@@ -2702,24 +2739,58 @@ async fn modern_skills_methods_single_target_authorization() {
 		async move { read_response_message(req.send().await.unwrap()).await }
 	};
 
-	// The denied skill is filtered out; the filtered listing is no longer shareable.
+	// The upstream serves `skills_result`: skills `code-review` and `secret`, each with a
+	// `references/private.md`. Everything the deny rule matches disappears, and cache hints
+	// become private because the result is now specific to this caller.
 	let list = send("skills/list", serde_json::json!({"cursor": "page1"})).await;
-	let mut expected = skills_result("skills/list");
-	expected["skills"].as_array_mut().unwrap().pop();
-	expected["ttlMs"] = 0.into();
-	expected["cacheScope"] = "private".into();
-	assert_eq!(list["result"], expected);
+	assert_eq!(
+		list["result"],
+		serde_json::json!({
+			"resultType": "complete",
+			// `secret` skill is dropped
+			"skills": [{
+				"uri": "skill://code-review/SKILL.md",
+				"frontmatter": {"name": "code-review", "description": "A skill.", "license": "MIT"},
+				// `references/private.md` is dropped from the manifest
+				"resources": [
+					{"uri": "skill://code-review/SKILL.md", "digest": "sha256:d248", "size": 149},
+					{"uri": "skill://code-review/references/checklist.md", "digest": "sha256:dbab", "size": 65}
+				],
+				"_meta": {"example.com/owner": "team-a"}
+			}],
+			"nextCursor": "page2",
+			"ttlMs": 0,
+			"cacheScope": "private",
+			"_meta": {"example.com/trace": "abc"}
+		})
+	);
 
 	let get = send(
 		"skills/get",
 		serde_json::json!({"uri": "skill://code-review/SKILL.md"}),
 	)
 	.await;
-	let mut expected = skills_result("skills/get");
-	expected["ttlMs"] = 0.into();
-	expected["cacheScope"] = "private".into();
-	assert_eq!(get["result"], expected);
+	assert_eq!(
+		get["result"],
+		serde_json::json!({
+			"resultType": "complete",
+			"skill": {
+				"uri": "skill://code-review/SKILL.md",
+				"frontmatter": {"name": "code-review", "description": "A skill.", "license": "MIT"},
+				// `references/private.md` is dropped from the manifest
+				"resources": [
+					{"uri": "skill://code-review/SKILL.md", "digest": "sha256:d248", "size": 149},
+					{"uri": "skill://code-review/references/checklist.md", "digest": "sha256:dbab", "size": 65}
+				],
+				"_meta": {"example.com/owner": "team-a"}
+			},
+			"ttlMs": 0,
+			"cacheScope": "private",
+			"_meta": {"example.com/trace": "abc"}
+		})
+	);
 
+	// A denied skill cannot be fetched directly.
 	let denied = send(
 		"skills/get",
 		serde_json::json!({"uri": "skill://secret/SKILL.md"}),
@@ -2727,17 +2798,99 @@ async fn modern_skills_methods_single_target_authorization() {
 	.await;
 	assert_eq!(denied["error"]["code"], -32602, "{denied}");
 
-	// The directory itself is allowed, but its denied child must not be listed.
+	// The directory itself is allowed; `private.md` is dropped from its entries.
 	let dir = send(
 		"resources/directory/read",
 		serde_json::json!({"uri": "skill://code-review/references"}),
 	)
 	.await;
-	let mut expected = skills_result("resources/directory/read");
-	expected["resources"].as_array_mut().unwrap().pop();
-	expected["ttlMs"] = 0.into();
-	expected["cacheScope"] = "private".into();
-	assert_eq!(dir["result"], expected);
+	assert_eq!(
+		dir["result"],
+		serde_json::json!({
+			"resultType": "complete",
+			"resources": [
+				{"uri": "skill://code-review/references/checklist.md", "name": "checklist.md", "mimeType": "text/markdown"}
+			],
+			"ttlMs": 0,
+			"cacheScope": "private"
+		})
+	);
+
+	// The guardrails hook sees the directory read once per phase, with typed params.
+	let requests = directory_requests.lock().unwrap();
+	assert_eq!(requests.len(), 1);
+	let params: serde_json::Value = serde_json::from_slice(requests[0].as_deref().unwrap()).unwrap();
+	assert_eq!(params["uri"], "skill://code-review/references");
+	assert_eq!(directory_responses.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn modern_skills_methods_multiple_targets() {
+	let alpha = mock_modern_streamable_http_server().await;
+	let beta = mock_modern_streamable_http_server().await;
+	let (other, _) = mock_mrtr_streamable_http_server().await;
+	let t = never_prefix_proxy(
+		vec![
+			("alpha", alpha.addr, false),
+			("beta", beta.addr, false),
+			("other", other.addr, false),
+		],
+		false,
+	);
+	let io = t.serve_real_listener(BIND_KEY).await;
+	let client = reqwest::Client::new();
+	let url = format!("http://{io}/mcp");
+	let send = |method: &'static str, mut params: serde_json::Value| {
+		params["_meta"] = modern_meta();
+		let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+		let mut req = mcp_json_post(&client, &url, &body)
+			.header("mcp-protocol-version", "2026-07-28")
+			.header("mcp-method", method);
+		if method == "resources/read" {
+			req = req.header("mcp-name", body["params"]["uri"].as_str().unwrap());
+		}
+		async move { read_response_message(req.send().await.unwrap()).await }
+	};
+
+	let list = send("skills/list", serde_json::json!({})).await;
+	let skills = list["result"]["skills"].as_array().unwrap();
+	assert_eq!(skills.len(), 4);
+	assert_eq!(list["result"]["ttlMs"], 0);
+	assert_eq!(list["result"]["cacheScope"], "private");
+	for target in ["alpha", "beta"] {
+		let uri = format!("skill://{target}/code-review/SKILL.md");
+		let skill = skills.iter().find(|skill| skill["uri"] == uri).unwrap();
+		assert_eq!(skill["frontmatter"]["name"], "code-review");
+		assert_eq!(skill["resources"][0]["uri"], uri);
+		assert_eq!(
+			skill["resources"][1]["uri"],
+			format!("skill://{target}/code-review/references/checklist.md")
+		);
+		assert_eq!(skill["resources"][1]["digest"], "sha256:dbab");
+
+		let params = serde_json::json!({"uri": uri});
+		let get = send("skills/get", params.clone()).await;
+		assert_eq!(&get["result"]["skill"], skill);
+		let read = send("resources/read", params).await;
+		assert_eq!(read["result"]["contents"][0]["uri"], uri);
+	}
+	let dir = send(
+		"resources/directory/read",
+		serde_json::json!({
+			"uri": "skill://beta/code-review/references"
+		}),
+	)
+	.await;
+	assert_eq!(
+		dir["result"]["resources"][0]["uri"],
+		"skill://beta/code-review/references/checklist.md"
+	);
+
+	let cursor = list["result"]["nextCursor"].as_str().unwrap();
+	assert_ne!(cursor, "page2");
+	let next = send("skills/list", serde_json::json!({"cursor": cursor})).await;
+	assert_eq!(next["result"]["skills"], serde_json::json!([]));
+	assert!(next["result"].get("nextCursor").is_none());
 }
 
 #[tokio::test]
@@ -3650,6 +3803,78 @@ async fn stateful_session_reuse_applies_route_guardrails() {
 	let msg = read_response_message(reused).await;
 	assert_eq!(msg["result"]["isError"], true, "{msg}");
 	assert_eq!(msg["result"]["content"][0]["text"], "denied by route b");
+}
+
+// `streamable` sessions are rebuilt from the session ID; `sse` sessions are held in memory.
+#[rstest::rstest]
+#[case::streamable(false)]
+#[case::sse(true)]
+#[tokio::test]
+async fn stateful_session_reuse_applies_route_backend_policies(#[case] legacy_sse: bool) {
+	let mock = if legacy_sse {
+		mock_sse_server().await
+	} else {
+		mock_streamable_http_server(true).await
+	};
+	let backend = strng::format!("/{}", mock.addr);
+	let deny_all = crate::types::agent::Authorization(Arc::new(RuleSet::new(PolicySet::new(
+		vec![],
+		vec![Arc::new(cel::Expression::new_strict("true").unwrap())],
+		vec![],
+	))));
+
+	let mut route_a = basic_named_route(backend.clone());
+	route_a.key = "route-a".into();
+	route_a.name.name = "route-a".into();
+	route_a.matches[0].path = crate::types::agent::PathMatch::Exact("/a".into());
+	let mut route_b = basic_named_route(backend);
+	route_b.key = "route-b".into();
+	route_b.name.name = "route-b".into();
+	route_b.matches[0].path = crate::types::agent::PathMatch::Exact("/b".into());
+	route_b.backends[0].inline_policies = vec![BackendTrafficPolicy::Authorization(deny_all)];
+
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_mcp_backend(mock.addr, true, legacy_sse)
+		.with_bind(simple_bind())
+		.with_route(route_a)
+		.with_route(route_b);
+	let io = t.serve_real_listener(BIND_KEY).await;
+	let client = reqwest::Client::new();
+
+	let initialize = serde_json::json!({
+		"jsonrpc": "2.0",
+		"id": 1,
+		"method": "initialize",
+		"params": {
+			"protocolVersion": "2025-06-18",
+			"capabilities": {},
+			"clientInfo": {"name": "scope-test", "version": "0"}
+		}
+	});
+	let response = mcp_json_post(&client, &format!("http://{io}/a"), &initialize)
+		.header("mcp-protocol-version", "2025-06-18")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(response.status(), reqwest::StatusCode::OK);
+	let sid = response.headers()["mcp-session-id"]
+		.to_str()
+		.unwrap()
+		.to_owned();
+
+	let list = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+	let send = |path: &str| {
+		mcp_json_post(&client, &format!("http://{io}{path}"), &list)
+			.header("mcp-protocol-version", "2025-06-18")
+			.header("mcp-session-id", &sid)
+			.send()
+	};
+	let allowed = read_response_message(send("/a").await.unwrap()).await;
+	assert!(allowed.get("result").is_some(), "{allowed}");
+
+	let reused = send("/b").await.unwrap();
+	assert_eq!(reused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -5523,7 +5748,23 @@ async fn mock_streamable_http_server_with_discover_versions(
 							}
 						}]
 					}),
-					m @ ("skills/list" | "skills/get" | "resources/directory/read") => skills_result(m),
+					"skills/list" if body["params"]["cursor"] == "page2" => serde_json::json!({
+						"skills": [], "resultType": "complete"
+					}),
+					"skills/get" if body["params"]["uri"] == "skill://code-review/SKILL.md" => {
+						skills_result(method)
+					},
+					"resources/directory/read"
+						if body["params"]["uri"] == "skill://code-review/references" =>
+					{
+						skills_result(method)
+					},
+					"resources/read" if body["params"]["uri"] == "skill://code-review/SKILL.md" => {
+						serde_json::json!({
+							"contents": [{"uri": "skill://code-review/SKILL.md", "text": "Skill instructions"}]
+						})
+					},
+					"skills/list" => skills_result(method),
 					_ => {
 						return Ok(axum::Json(serde_json::json!({
 								"jsonrpc": "2.0",
@@ -6786,7 +7027,7 @@ async fn test_zero_targets_fail_closed() {
 	let client = PolicyClient::new(setup_proxy_test("{}").unwrap().pi);
 	let ctx = crate::mcp::upstream::IncomingRequestContext::empty();
 	let err =
-		crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx).unwrap_err();
+		crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx, None).unwrap_err();
 	assert!(matches!(err, crate::mcp::Error::NoBackends));
 }
 
@@ -6799,7 +7040,7 @@ async fn test_zero_targets_fail_open() {
 	};
 	let client = PolicyClient::new(setup_proxy_test("{}").unwrap().pi);
 	let ctx = crate::mcp::upstream::IncomingRequestContext::empty();
-	crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx).unwrap();
+	crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx, None).unwrap();
 }
 
 #[tokio::test]
@@ -6838,7 +7079,8 @@ async fn test_setup_partial_success_fail_open() {
 	};
 	let client = PolicyClient::new(setup_proxy_test("{}").unwrap().pi);
 	let ctx = crate::mcp::upstream::IncomingRequestContext::empty();
-	let group = crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx).unwrap();
+	let group =
+		crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx, None).unwrap();
 	assert_eq!(group.size(), 1);
 }
 
@@ -6878,7 +7120,7 @@ async fn test_all_targets_fail_open_still_errors() {
 	let client = PolicyClient::new(setup_proxy_test("{}").unwrap().pi);
 	let ctx = crate::mcp::upstream::IncomingRequestContext::empty();
 	let err =
-		crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx).unwrap_err();
+		crate::mcp::upstream::UpstreamGroup::new_for_request(client, backend, &ctx, None).unwrap_err();
 	assert!(matches!(err, crate::mcp::Error::NoBackends));
 }
 
@@ -6919,16 +7161,6 @@ fn fake_sse_target(name: &str, addr: SocketAddr) -> Arc<McpTarget> {
 }
 
 fn fake_openapi_target(name: &str, addr: SocketAddr) -> Arc<McpTarget> {
-	let schema: OpenAPI = serde_json::from_value(serde_json::json!({
-		"openapi": "3.0.0",
-		"info": {
-			"title": "Test API",
-			"version": "1.0.0"
-		},
-		"paths": {}
-	}))
-	.expect("valid OpenAPI schema");
-
 	Arc::new(McpTarget {
 		name: name.into(),
 		condition: None,
@@ -6936,7 +7168,7 @@ fn fake_openapi_target(name: &str, addr: SocketAddr) -> Arc<McpTarget> {
 			backend: crate::types::agent::SimpleBackendReference::Backend(strng::format!(
 				"/unused-{name}"
 			)),
-			schema: Arc::new(schema),
+			tools: Vec::new().into(),
 			prefix: String::new(),
 		}),
 		backend_policies: Default::default(),
@@ -7702,9 +7934,9 @@ fn test_merge_discover_unions_extensions_recorded_at_initialize() {
 		"discover must include extensions recorded from the legacy target's initialize"
 	);
 	assert!(extensions.contains_key("example.com/other"));
-	assert!(
-		!extensions.contains_key(rmcp::model::SKILLS_EXTENSION_ID),
-		"skills cannot be routed when multiplexing"
+	assert_eq!(
+		extensions[rmcp::model::SKILLS_EXTENSION_ID]["directoryRead"],
+		true
 	);
 }
 
@@ -8876,6 +9108,67 @@ async fn mcp_guardrails_denies_tool_by_name() {
 		.await
 		.expect("allowed tool call should pass through mcpGuardrails");
 	assert!(!result.content.is_empty(), "echo should return content");
+}
+
+// A guardrail screening the input a client supplies to a running task.
+#[tokio::test]
+async fn mcp_guardrails_task_update_request() {
+	use protos::ext_mcp::authorization_error::Code;
+
+	use crate::test_helpers::extmcpmock::{
+		closure_mock, pass_request, pass_response, reject_request,
+	};
+
+	let extmcp_mock = closure_mock(
+		|req| {
+			let body = String::from_utf8_lossy(req.mcp_request.as_deref().unwrap_or_default());
+			if req.method == "tasks/update" && body.contains("hunter2") {
+				reject_request(
+					Code::PermissionDenied,
+					"input contains a secret".to_string(),
+				)
+			} else {
+				pass_request()
+			}
+		},
+		|_| pass_response(),
+	)
+	.spawn()
+	.await;
+
+	let mock = mock_task_streamable_http_server().await;
+	let policy = guardrails_test_support::policy_with(
+		extmcp_mock.address,
+		crate::mcp::guardrails::FailureMode::FailClosed,
+		std::collections::HashMap::from([(
+			"tasks/*".to_string(),
+			crate::mcp::guardrails::Phase::Request,
+		)]),
+		std::collections::HashMap::new(),
+	);
+	let (_bind, io) = setup_proxy_policies(&mock, false, false, vec![policy]).await;
+
+	let update = |id, answer: &'static str| {
+		modern_request(
+			io,
+			id,
+			"tasks/update",
+			"task-abc",
+			serde_json::json!({
+				"taskId": "task-abc",
+				"inputResponses": {"q1": {"action": "accept", "content": {"answer": answer}}}
+			}),
+		)
+	};
+	let denied = update(1, "hunter2").await;
+	assert!(
+		denied["error"]["message"]
+			.as_str()
+			.is_some_and(|m| m.contains("input contains a secret")),
+		"{denied}"
+	);
+	let allowed = update(2, "blue").await;
+	assert_eq!(allowed["result"]["resultType"], "complete", "{allowed}");
 }
 
 #[tokio::test]
