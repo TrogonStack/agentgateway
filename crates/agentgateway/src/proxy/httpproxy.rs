@@ -97,7 +97,6 @@ fn classify_request_protocol(req: &Request, backend: &Backend) -> RequestProtoco
 		// continue through the ordinary HTTP path.
 		Backend::MCP(_, _)
 			if req.method() == ::http::Method::POST
-				&& req.uri().path() != "/sse"
 				&& !mcp::auth::is_well_known_endpoint(req.uri().path())
 				&& !req.uri().path().ends_with("client-registration")
 				&& !crate::http::is_grpc_request(req) =>
@@ -676,6 +675,11 @@ async fn apply_llm_request_policies(
 	})
 }
 
+/// Marks a request received on a listener that terminated HTTPS. Outer TLS (CONNECT, HBONE) carried
+/// onto an inner plaintext connection does not count.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpsListener;
+
 #[derive(Clone)]
 pub struct HTTPProxy {
 	pub(super) bind_name: BindKey,
@@ -727,6 +731,13 @@ where
 }
 
 impl HTTPProxy {
+	fn is_https(&self) -> bool {
+		self
+			.selected_listener
+			.as_ref()
+			.is_some_and(|l| l.protocol.is_https())
+	}
+
 	pub async fn proxy(&self, connection: Arc<Extension>, mut req: Request) -> Response {
 		let start = agent_core::Timestamp::now();
 
@@ -737,18 +748,16 @@ impl HTTPProxy {
 			.expect("tcp connection must be set")
 			.clone();
 		connection.copy::<TLSConnectionInfo>(req.extensions_mut());
+		let is_https = self.is_https();
+		if is_https {
+			req.extensions_mut().insert(HttpsListener);
+		}
 		if connection
 			.copy::<ActorIdentity>(req.extensions_mut())
 			.is_some()
 		{
 			// Outer CONNECT TLS authenticates the actor but does not make inner HTTP HTTPS.
-			let protocol = if matches!(
-				self
-					.selected_listener
-					.as_ref()
-					.map(|listener| &listener.protocol),
-				Some(ListenerProtocol::HTTPS(_))
-			) {
+			let protocol = if is_https {
 				EgressRequestProtocol::Https
 			} else {
 				EgressRequestProtocol::Http
@@ -866,7 +875,7 @@ impl HTTPProxy {
 		});
 
 		crate::http::mark_sensitive_headers(req, &self.inputs.cfg.sensitive_headers);
-		normalize_uri(log.tls_info.as_ref(), req)?;
+		normalize_uri(self.is_https(), req)?;
 		set_destination_hostname(req);
 		Ok(bind)
 	}
@@ -1435,6 +1444,7 @@ impl HTTPProxy {
 					max_connection_duration: None,
 					backend: Some(selected_backend.backend.backend.name()),
 				},
+				matches!(&selected_backend.backend.backend, Backend::Dynamic(_, _)),
 			)
 			.await?;
 		let mut resp = ::http::Response::builder()
@@ -1745,6 +1755,7 @@ async fn handle_upgrade(
 		upgrade_type,
 		upgrade,
 	} = req_upgrade_type;
+	let buffer_limit = http::response_buffer_limit(&resp);
 	let resp_upgrade_type = get_upgrade_type(resp.headers());
 	// Case insensitive: https://www.rfc-editor.org/rfc/rfc6455.html#section-4.2.1
 	if !resp_upgrade_type
@@ -1782,6 +1793,7 @@ async fn handle_upgrade(
 				parse::websocket::guarded_realtime_proxy(
 					TokioIo::new(req),
 					server,
+					buffer_limit,
 					guard_context.prompt_guard,
 					guard_context.policy_client,
 					llm,
@@ -1792,7 +1804,7 @@ async fn handle_upgrade(
 				.await;
 				return;
 			}
-			let mut server = parse::websocket::parser(server, llm).await;
+			let mut server = parse::websocket::parser(server, llm, buffer_limit).await;
 			let _ = agent_core::copy::copy_bidirectional(
 				&mut TokioIo::new(req),
 				&mut server,
@@ -3153,13 +3165,9 @@ async fn make_backend_call(
 								input_format: InputFormat::Realtime,
 								cache_convention: llm::CacheTokenConvention::pending(),
 								request_model,
-								original_model: None,
 								streaming: true,
 								provider: llm.provider.provider(),
-								input_tokens: None,
-								params: Default::default(),
-								prompt: Default::default(),
-								provider_state: None,
+								..Default::default()
 							})
 						});
 					}
@@ -4171,16 +4179,12 @@ mod tests {
 
 	fn llm_request() -> llm::LLMRequest {
 		llm::LLMRequest {
-			input_tokens: None,
 			input_format: llm::InputFormat::Completions,
 			cache_convention: llm::CacheTokenConvention::pending(),
 			request_model: "test-model".into(),
-			original_model: None,
 			provider: "test-provider".into(),
 			streaming: true,
-			params: Default::default(),
-			prompt: None,
-			provider_state: None,
+			..Default::default()
 		}
 	}
 
@@ -4476,6 +4480,39 @@ mod tests {
 		assert!(!req.headers().contains_key("x-original-url"));
 	}
 
+	#[test]
+	fn hop_by_hop_headers_strips_http2_upgrades() {
+		let mut req = ::http::Request::builder()
+			.uri("http://app/")
+			.header("connection", "upgrade")
+			.header("upgrade", "H2C, HTTP/2.0")
+			.header("http2-settings", "AAMAAABkAAQAAP__")
+			.body(http::Body::empty())
+			.expect("request should build");
+		assert!(hop_by_hop_headers(&mut req).is_none());
+		assert!(!req.headers().contains_key("connection"));
+		assert!(!req.headers().contains_key("upgrade"));
+		assert!(!req.headers().contains_key("http2-settings"));
+
+		let mut req = ::http::Request::builder()
+			.uri("http://app/")
+			.header("connection", "upgrade")
+			.header("upgrade", "websocket")
+			.header("upgrade", "h2c")
+			.body(http::Body::empty())
+			.expect("request should build");
+		hop_by_hop_headers(&mut req);
+		assert_eq!(
+			req
+				.headers()
+				.get_all("upgrade")
+				.iter()
+				.map(|v| v.to_str().unwrap())
+				.collect::<Vec<_>>(),
+			vec!["websocket"]
+		);
+	}
+
 	#[tokio::test]
 	async fn llm_session_affinity_pins_provider() {
 		let first = wiremock::MockServer::start().await;
@@ -4762,7 +4799,7 @@ async fn send_mirror(
 // that request policies such as `basicAuth` can read it when the
 // gateway acts as an authenticated forward proxy.
 // Preserve Trailer so Hyper's HTTP/1 encoder can forward the declared trailer fields.
-static HOP_HEADERS: [HeaderName; 7] = [
+static HOP_HEADERS: [HeaderName; 8] = [
 	header::CONNECTION,
 	// non-standard but still sent by libcurl and rejected by e.g. google
 	HeaderName::from_static("proxy-connection"),
@@ -4771,6 +4808,7 @@ static HOP_HEADERS: [HeaderName; 7] = [
 	header::TE,
 	header::TRANSFER_ENCODING,
 	header::UPGRADE,
+	HeaderName::from_static("http2-settings"),
 ];
 
 fn connection_header_tokens(headers: &HeaderMap) -> Vec<HeaderName> {
@@ -4813,7 +4851,7 @@ fn hop_by_hop_headers(req: &mut Request) -> Option<RequestUpgrade> {
 		.map(|s| s.contains("trailers"))
 		.unwrap_or(false);
 	let connection_headers = connection_header_tokens(req.headers());
-	let upgrade_type = get_upgrade_type(req.headers());
+	let upgrade_type = get_request_upgrade_type(req.headers());
 	for h in connection_headers {
 		req.headers_mut().remove(h);
 	}
@@ -4845,6 +4883,36 @@ fn hop_by_hop_headers(req: &mut Request) -> Option<RequestUpgrade> {
 	}
 }
 
+// Collects the requested upgrade protocols across all Upgrade headers, dropping HTTP/2 upgrades.
+// Once a backend accepts an upgrade the connection becomes an opaque tunnel; for HTTP/2 that would
+// let the client send arbitrary requests to the backend that bypass routing and policies.
+// Ignoring the upgrade is always safe: the client continues with HTTP/1.1.
+fn get_request_upgrade_type(headers: &HeaderMap) -> Option<HeaderValue> {
+	if !headers
+		.typed_get::<headers::Connection>()
+		.is_some_and(|con| con.contains(http::header::UPGRADE))
+	{
+		return None;
+	}
+	let protocols = headers
+		.get_all(http::header::UPGRADE)
+		.into_iter()
+		.filter_map(|value| value.to_str().ok())
+		.flat_map(|value| value.split(','))
+		.map(str::trim)
+		.filter(|p| {
+			!p.is_empty()
+				&& !p.eq_ignore_ascii_case("h2c")
+				&& !p.eq_ignore_ascii_case("h2")
+				&& !p.get(..6).is_some_and(|v| v.eq_ignore_ascii_case("http/2"))
+		})
+		.collect::<Vec<_>>();
+	if protocols.is_empty() {
+		return None;
+	}
+	HeaderValue::from_str(&protocols.join(", ")).ok()
+}
+
 fn get_upgrade_type(headers: &HeaderMap) -> Option<HeaderValue> {
 	if let Some(con) = headers.typed_get::<headers::Connection>() {
 		if con.contains(http::header::UPGRADE) {
@@ -4859,7 +4927,7 @@ fn get_upgrade_type(headers: &HeaderMap) -> Option<HeaderValue> {
 
 // Normalize the Host header into the URI authority so the rest of the code doesn't need to care
 // whether the client supplied Host or :authority.
-fn normalize_uri(tls: Option<&TLSConnectionInfo>, req: &mut Request) -> Result<(), ProxyError> {
+fn normalize_uri(is_https: bool, req: &mut Request) -> Result<(), ProxyError> {
 	debug!("request before normalization: {req:?}");
 	let host = match req.headers_mut().entry(http::header::HOST) {
 		http::header::Entry::Occupied(e) => {
@@ -4883,7 +4951,7 @@ fn normalize_uri(tls: Option<&TLSConnectionInfo>, req: &mut Request) -> Result<(
 		parts.authority = Some(host);
 		if parts.path_and_query.is_some() && parts.scheme.is_none() {
 			// TODO: or always do this?
-			if tls.is_some() {
+			if is_https {
 				parts.scheme = Some(Scheme::HTTPS);
 			} else {
 				parts.scheme = Some(Scheme::HTTP);
@@ -4931,7 +4999,7 @@ mod destination_context_tests {
 			hostname: None,
 		});
 
-		normalize_uri(None, &mut req).unwrap();
+		normalize_uri(false, &mut req).unwrap();
 		set_destination_hostname(&mut req);
 
 		assert_eq!(
@@ -4945,6 +5013,26 @@ mod destination_context_tests {
 				.and_then(|destination| destination.hostname.as_deref()),
 			Some("api.example.com")
 		);
+	}
+
+	#[test]
+	fn normalize_uri_scheme_controls_default_dynamic_port() {
+		for (is_https, expected_scheme, expected_port) in
+			[(false, Scheme::HTTP, 80), (true, Scheme::HTTPS, 443)]
+		{
+			let mut req = ::http::Request::builder()
+				.version(::http::Version::HTTP_11)
+				.uri("/plain")
+				.header(::http::header::HOST, "example.internal")
+				.body(http::Body::empty())
+				.unwrap();
+			normalize_uri(is_https, &mut req).unwrap();
+			assert_eq!(req.uri().scheme(), Some(&expected_scheme));
+			assert_eq!(
+				target_from_request(&req).unwrap(),
+				Target::from(("example.internal", expected_port))
+			);
+		}
 	}
 }
 

@@ -34,7 +34,7 @@ use rmcp::model::{
 };
 pub use router::App;
 use thiserror::Error;
-pub(crate) use upstream::{openapi_server_prefix, parse_openapi_schema};
+pub(crate) use upstream::{OpenAPITools, openapi_server_prefix, parse_openapi_schema};
 
 use crate::http::SyncResponse;
 use crate::proxy::ProxyError;
@@ -409,7 +409,9 @@ pub(crate) async fn maybe_convert_mcp_error<T>(
 	) {
 		return Err(err);
 	}
-	if request_protocol != crate::proxy::httpproxy::RequestProtocol::Mcp {
+	// Legacy SSE delivers JSON-RPC replies on the GET stream and reports POST failures via HTTP.
+	if request_protocol != crate::proxy::httpproxy::RequestProtocol::Mcp || req.uri().path() == "/sse"
+	{
 		return Err(err);
 	}
 	let limit = crate::http::buffer_limit(req);
